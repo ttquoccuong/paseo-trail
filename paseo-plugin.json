@@ -1,0 +1,24 @@
+{
+  "id": "trail",
+  "name": "Trail",
+  "requirements": {
+    "paseo": ">=0.13.0"
+  },
+  "description": "Buttons above the chat for a session's task, merge and pull requests with live status, and touched files",
+  "icon": "assets/icon.png",
+  "media": [
+    "assets/overview.jpg",
+    "assets/task.jpg",
+    "assets/files.jpg",
+    "assets/task-doc.jpg",
+    "assets/settings.jpg"
+  ],
+  "translations": {
+    "vi": {
+      "description": "Các nút ngay trên ô chat cho task của phiên, merge request và pull request kèm trạng thái trực tiếp, và các file đã đụng tới"
+    },
+    "zh-CN": {
+      "description": "在聊天框上方显示会话的任务、带实时状态的 merge request 和 pull request，以及接触过的文件"
+    }
+  }
+}
