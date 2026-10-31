@@ -1,6 +1,5 @@
 {
   "name": "paseo-trail",
-  "private": true,
   "version": "0.1.0",
   "description": "Buttons above the chat for a session's task, merge and pull requests with live status, and touched files",
   "license": "MIT",
