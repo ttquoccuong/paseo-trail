@@ -13,6 +13,7 @@
     "OVERVIEW.md",
     "OVERVIEW.*.md",
     "README.md",
+    "docs/",
     "LICENSE",
     "assets/",
     "index.client.tsx",
