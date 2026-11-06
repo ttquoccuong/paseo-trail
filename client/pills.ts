@@ -9,11 +9,17 @@ import {
 import {
   credentialStatusRpc,
   listLinksRpc,
+  pinLinkRpc,
   setModeRpc,
+  type ChecklistItem,
   type CredentialStatus,
   type DisplayMode,
   type SessionLink,
 } from "../shared/links";
+import { candidateEntries, guessedTaskLook } from "./candidates";
+import { checklistEntries, taskPillLook } from "./checklist";
+import { checklistItemDetails } from "./checklist-details";
+import { fitPath, pageText } from "./file-titles";
 import { translator, type Translate } from "./i18n";
 import { credentialIdOf, mergeRequestsButton, mergeRequestsSignature } from "./merge-requests";
 import { hostOf, openableUrl } from "./urls";
@@ -31,6 +37,11 @@ const CREDENTIAL_POLL_MS = 60_000;
 const CREDENTIAL_SOON_MS = 5_000;
 // Agent updates arrive in bursts while a turn streams.
 const UPDATE_DEBOUNCE_MS = 1000;
+// A failed read is usually the daemon reloading the plugin, which takes about a second. A bar that
+// has just been loaded is empty until a read succeeds, so it asks again soon, a few times, before
+// falling back to the regular poll.
+const RETRY_MS = 1000;
+const MAX_QUICK_RETRIES = 5;
 
 const ICON: Record<SessionLink["kind"], string> = {
   task: "FileText",
@@ -39,6 +50,9 @@ const ICON: Record<SessionLink["kind"], string> = {
   doc: "BookOpen",
   link: "Link",
 };
+
+// A file the agent changed; a trailing "(edited)" would be cut off with the rest of a long title.
+const EDITED_FILE_ICON = "FilePen";
 
 // In "all" mode these kinds collapse into one button each, newest first in its menu.
 const GROUPS: Array<{ kind: SessionLink["kind"]; label: MessageKey; title: MessageKey }> = [
@@ -58,6 +72,7 @@ interface SessionView {
   mode: DisplayMode;
   canToggle: boolean;
   links: SessionLink[];
+  checklist: ChecklistItem[];
 }
 
 interface AgentLike {
@@ -84,6 +99,8 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
   let languageKey = "";
   let refreshQueued = false;
   let debounce: ReturnType<typeof setTimeout> | undefined;
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  let failedReads = 0;
 
   function clearPills(agentId: string) {
     for (const { pill } of shown.get(agentId) ?? []) pill.remove();
@@ -110,8 +127,10 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
         items: [...links].reverse().map((link, index) => ({
           kind: "item" as const,
           id: `item-${index}`,
-          title: link.kind === "file" && link.edited ? t("groups.edited", { path: link.title }) : link.kind === "file" ? link.title : link.label,
-          icon: ICON[link.kind],
+          // Rows cannot wrap or show a tooltip, so files and pages are cut in the middle instead of
+          // at the end, where what tells them apart is.
+          title: link.kind === "file" ? fitPath(link.label) : link.kind === "doc" || link.kind === "link" ? fitPath(pageText(link.url)) : link.label,
+          icon: link.kind === "file" && link.edited ? EDITED_FILE_ICON : ICON[link.kind],
           behavior: {
             kind: "action" as const,
             onPress: () =>
@@ -127,17 +146,29 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
   function desiredPills(agentId: string, workspaceId: string, view: SessionView) {
     const { links } = view;
     const mergeRequests = links.filter((link) => link.kind === "mr");
+    // Links come main task first; other pinned tasks have no list of their own.
+    const mainTask = links.find((link) => link.kind === "task");
     const pills: Array<{ key: string; signature: string; button: PluginButton }> = [];
     for (const link of links) {
       if (link.kind === "task" || (link.kind === "link" && view.mode === "task")) {
+        const checklist = link === mainTask ? view.checklist : [];
+        const rows = checklistEntries(checklist, t, checklistItemDetails, Date.now());
+        // Row titles carry ages, so a stale item's row updates when its age does, not on every poll.
+        const rowTitles = rows.map((row) => (row.kind === "item" ? row.title : row.id));
         pills.push({
           key: link.url,
-          signature: JSON.stringify({ link, mode: view.mode, canToggle: view.canToggle, languageKey }),
+          signature: JSON.stringify({ link, mode: view.mode, canToggle: view.canToggle, checklist, rowTitles, languageKey }),
           button: {
             title: link.title,
-            label: link.kind === "task" ? t("task.label", { name: link.label }) : link.label,
-            icon: ICON[link.kind],
-            behavior: linkBehavior(link, workspaceId, agentId, link.kind === "task" ? view : undefined),
+            ...(link.kind !== "task"
+              ? { label: link.label, icon: ICON[link.kind] }
+              : link.candidates
+                ? guessedTaskLook(link.label, t)
+                : taskPillLook(link.label, checklist, t)),
+            behavior: withLeadingEntries(linkBehavior(link, workspaceId, agentId, link.kind === "task" ? view : undefined), [
+              ...candidateEntries(link, t, (target) => void pinTask(agentId, target)),
+              ...rows,
+            ]),
           },
         });
       } else if (link === mergeRequests[0]) {
@@ -160,6 +191,31 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
       }
     }
     return pills;
+  }
+
+  // Candidates and the checklist go above whatever the task's menu holds. A task with one page opens
+  // it on press, so once it has such rows that press becomes a row of the menu; one with nothing to
+  // open just lists.
+  function withLeadingEntries(behavior: PluginButtonBehavior, entries: PluginButtonMenuEntry[]): PluginButtonBehavior {
+    if (entries.length === 0) return behavior;
+    if (behavior.kind === "menu") {
+      const rest = behavior.items;
+      return { kind: "menu", items: rest.length > 0 ? [...entries, ...rest] : entries.slice(0, -1) };
+    }
+    return {
+      kind: "menu",
+      items: [...entries, { kind: "item", id: "open", title: t("task.openPage"), icon: "Globe", behavior }],
+    };
+  }
+
+  // The same pin as `/trail pin`: a task doc pinned by the user is the session's task from then on.
+  async function pinTask(agentId: string, target: string) {
+    try {
+      await client.rpc(pinLinkRpc, { agentId, target, unpin: false });
+    } catch (error) {
+      console.error("trail: could not set the main task", error);
+    }
+    void refresh();
   }
 
   async function setMode(agentId: string, mode: DisplayMode) {
@@ -189,7 +245,7 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
     for (const agentId of agentIds) {
       // Each session draws on its own; one that fails keeps its last bar and the others go on.
       try {
-        render(agentId, sessions[agentId] ?? { mode: "all", canToggle: false, links: [] });
+        render(agentId, sessions[agentId] ?? { mode: "all", canToggle: false, links: [], checklist: [] });
       } catch (error) {
         console.error(`trail: could not draw the bar for ${agentId}`, error);
       }
@@ -337,8 +393,16 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
         );
         if (unknownForge) void refreshCredentials(true).then((changed) => changed && redraw());
       }
+      failedReads = 0;
     } catch (error) {
-      if (!lifetime.signal.aborted) console.error("trail: refresh failed", error);
+      if (!lifetime.signal.aborted) {
+        console.error("trail: refresh failed", error);
+        failedReads += 1;
+        if (failedReads <= MAX_QUICK_RETRIES) {
+          clearTimeout(retry);
+          retry = setTimeout(() => void refresh(), RETRY_MS);
+        }
+      }
     } finally {
       refreshing = false;
       if (refreshQueued) {
@@ -396,6 +460,7 @@ export function syncSessionLinkPills(client: PluginClientContext): PillSync {
       lifetime.abort();
       clearInterval(poll);
       clearTimeout(debounce);
+      clearTimeout(retry);
       for (const agentId of [...shown.keys()]) clearPills(agentId);
     },
   };

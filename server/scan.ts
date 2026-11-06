@@ -1,10 +1,12 @@
+import { createHash } from "node:crypto";
 import { findChangeRequests, findTaskDocs, type TaskDocRules } from "./extract";
 import { findMergeRequestRefs } from "./mr-refs";
 import { SCAN_GLOB_BUDGET, trimEnd } from "./project-config";
+import { emptyLedger, recordSightings, type TaskLedger, type TaskSighting } from "./task-evidence";
 
 export interface ScanState {
-  /** Task doc path → strongest evidence that this session works on it; least recently seen first. */
-  tasks: Record<string, number>;
+  /** Evidence of which task doc this session works on. */
+  tasks: TaskLedger;
   /**
    * MR and PR URLs, and `name!N` / `group/project!N` references written without one (resolved when
    * listed), least recently mentioned first.
@@ -19,7 +21,6 @@ export interface ScanState {
 // A session is scanned every 30 seconds and its state kept on disk, so every list is capped at a
 // few times what the bar shows (5 requests, 15 entries per group) and every text is cut short.
 export const SCAN_LIMITS = {
-  tasks: 50,
   mergeRequests: 40,
   urls: 60,
   files: 60,
@@ -76,34 +77,36 @@ export function withoutUserInfo(url: string): string | null {
   }
 }
 
-// The user naming a doc or the agent editing it says far more about the session's main
-// task than the agent reading it or mentioning it while searching around.
-const WEIGHT = { userMessage: 5, edit: 4, read: 1, assistantMessage: 1 } as const;
-// Only evidence at this weight or above can make a doc the main task.
-export const MAIN_TASK_MIN_WEIGHT = WEIGHT.edit;
-
 export interface TimelineItemLike {
   type: string;
   text?: string;
+  /** When the entry was recorded; tells two user messages with the same text apart. */
+  timestamp?: string;
   detail?: { type?: string; filePath?: string };
 }
 
-export function emptyScan(): ScanState {
-  return { tasks: {}, mergeRequests: [], urls: [], files: {} };
+/** The links one scan of the timeline found, and the task docs it saw, for `mergeScans`. */
+export interface TimelineScan extends Omit<ScanState, "tasks"> {
+  sightings: TaskSighting[];
+  /** The scan began at the session's first message. */
+  fromStart: boolean;
 }
 
-// Accumulates evidence in insertion order, newest last, so each list keeps its most recent part.
+export function emptyScan(): ScanState {
+  return { tasks: emptyLedger(), mergeRequests: [], urls: [], files: {} };
+}
+
+// The same user message is read again by every scan whose window still holds it; its key says
+// which turn it was without keeping its text.
+function userMessageKey(item: TimelineItemLike, text: string): string {
+  return createHash("sha256").update(`${item.timestamp ?? ""}\u0000${text}`).digest("hex").slice(0, 16);
+}
+
+// Accumulates links in insertion order, newest last, so each list keeps its most recent part.
 class ScanBuilder {
-  readonly tasks = new Map<string, number>();
   readonly mergeRequests = new Set<string>();
   readonly urls = new Set<string>();
   readonly files = new Map<string, "read" | "edited">();
-
-  noteTask(doc: string, weight: number) {
-    const best = Math.max(this.tasks.get(doc) ?? 0, weight);
-    this.tasks.delete(doc);
-    this.tasks.set(doc, best);
-  }
 
   noteFile(path: string, use: "read" | "edited") {
     const kept = this.files.get(path) === "edited" ? "edited" : use;
@@ -111,16 +114,14 @@ class ScanBuilder {
     this.files.set(path, kept);
   }
 
-  add(scan: ScanState) {
-    for (const [doc, weight] of Object.entries(scan.tasks)) this.noteTask(doc, weight);
+  add(scan: Omit<ScanState, "tasks">) {
     for (const request of scan.mergeRequests) touch(this.mergeRequests, request);
     for (const url of scan.urls ?? []) touch(this.urls, url);
     for (const [path, use] of Object.entries(scan.files ?? {})) this.noteFile(path, use);
   }
 
-  build(): ScanState {
+  build(): Omit<ScanState, "tasks"> {
     return {
-      tasks: Object.fromEntries(newest(this.tasks, SCAN_LIMITS.tasks)),
       mergeRequests: newest(this.mergeRequests, SCAN_LIMITS.mergeRequests),
       urls: newest(this.urls, SCAN_LIMITS.urls),
       files: Object.fromEntries(newest(this.files, SCAN_LIMITS.files)),
@@ -128,12 +129,23 @@ class ScanBuilder {
   }
 }
 
-export function scanTimeline(items: readonly TimelineItemLike[], rules: TaskDocRules | null): ScanState {
+/**
+ * Reads one window of the timeline, oldest first. `fromStart` says the window begins at the
+ * session's first message, when the first user message in it opened the session.
+ */
+export function scanTimeline(
+  items: readonly TimelineItemLike[],
+  rules: TaskDocRules | null,
+  { fromStart = false }: { fromStart?: boolean } = {},
+): TimelineScan {
   const scan = new ScanBuilder();
+  const sightings: TaskSighting[] = [];
   // One matching budget for the whole scan, however many messages it reads.
   const globBudget = { left: SCAN_GLOB_BUDGET };
-  const noteTasks = (text: string | undefined, weight: number) => {
-    for (const doc of findTaskDocs((text ?? "").slice(0, SCAN_LIMITS.textLength), rules, globBudget)) scan.noteTask(doc, weight);
+  const docsIn = (text: string | undefined) => findTaskDocs((text ?? "").slice(0, SCAN_LIMITS.textLength), rules, globBudget);
+  const noteTasks = (text: string | undefined, signal: "edit" | "read" | "mention") => {
+    const docs = docsIn(text);
+    if (docs.length > 0) sightings.push({ signal, docs });
   };
   const noteMergeRequests = (raw: string | undefined) => {
     const text = (raw ?? "").slice(0, SCAN_LIMITS.textLength);
@@ -169,41 +181,42 @@ export function scanTimeline(items: readonly TimelineItemLike[], rules: TaskDocR
   }
   for (const item of merged.slice(first)) {
     if (item.type === "user_message") {
-      noteTasks(item.text, WEIGHT.userMessage);
+      // Every user message counts as a turn, naming a doc or not, so evidence can fade by turns.
+      const text = (item.text ?? "").slice(0, SCAN_LIMITS.textLength);
+      sightings.push({ signal: "user", key: userMessageKey(item, text), docs: docsIn(text) });
       noteMergeRequests(item.text);
     } else if (item.type === "assistant_message") {
-      noteTasks(item.text, WEIGHT.assistantMessage);
+      noteTasks(item.text, "mention");
       noteMergeRequests(item.text);
     } else if (item.type === "tool_call" && item.detail) {
       const { detail } = item;
       if (detail.type === "read") {
-        noteTasks(detail.filePath, WEIGHT.read);
+        noteTasks(detail.filePath, "read");
         noteFile(detail.filePath, "read");
       }
       if (detail.type === "edit" || detail.type === "write") {
-        noteTasks(detail.filePath, WEIGHT.edit);
+        noteTasks(detail.filePath, "edit");
         noteFile(detail.filePath, "edited");
       }
       // Shell commands and output are skipped: anything they print (fixtures, listings, other
       // sessions' state) would surface as a link. An MR the agent creates gets named in its reply.
     }
   }
-  return scan.build();
+  // Messages older than the text budget were left out, so the window no longer starts the session.
+  return { ...scan.build(), sightings, fromStart: fromStart && first === 0 };
 }
 
 /** Older evidence stays even after it scrolls out of the scanned window; newer comes last. */
-export function mergeScans(previous: ScanState, next: ScanState): ScanState {
+export function mergeScans(previous: ScanState, next: TimelineScan): ScanState {
   const scan = new ScanBuilder();
   scan.add(previous);
   scan.add(next);
-  return scan.build();
+  return { tasks: recordSightings(previous.tasks, next.sightings, next.fromStart), ...scan.build() };
 }
 
-export function mainScannedTask(scan: ScanState): string | undefined {
-  let best: string | undefined;
-  for (const [doc, weight] of Object.entries(scan.tasks)) {
-    if (weight < MAIN_TASK_MIN_WEIGHT) continue;
-    if (best === undefined || weight > scan.tasks[best]) best = doc;
-  }
-  return best;
+/** `scan` with the current caps applied to its lists, for state written before them. */
+export function boundScan(scan: ScanState): ScanState {
+  const lists = new ScanBuilder();
+  lists.add(scan);
+  return { tasks: recordSightings(scan.tasks, [], false), ...lists.build() };
 }

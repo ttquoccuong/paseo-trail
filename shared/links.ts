@@ -39,9 +39,28 @@ export const sessionLinkSchema = z.object({
   bundle: z.array(z.string()).optional(),
   /** Last known GitLab state of an MR link; absent until the first fetch succeeds. */
   status: mergeRequestStatusSchema.optional(),
+  /**
+   * For a main task Trail guessed when other docs come close: the guess and those docs, most likely
+   * first, each with the `target` that pins it.
+   */
+  candidates: z.array(z.object({ target: z.string(), label: z.string(), title: z.string() })).optional(),
 });
 
 export type SessionLink = z.infer<typeof sessionLinkSchema>;
+
+/** One thing the session's main task needs done; `why` says why it cannot finish without it. */
+export const checklistItemSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+  why: z.string(),
+  status: z.enum(["todo", "doing", "waiting", "done", "dropped"]),
+  /** About the current status: evidence it is done, who or what it waits on, why it was dropped. */
+  note: z.string().optional(),
+  /** When the item was added or last changed; absent in lists written before it was kept. */
+  updatedAt: z.string().optional(),
+});
+
+export type ChecklistItem = z.infer<typeof checklistItemSchema>;
 
 /** `task`: only what belongs to the session's task. `all`: every link the session touched. */
 /**
@@ -76,7 +95,12 @@ export const listLinksRpc = defineRpc({
     language: z.enum(["app", "en", "vi"]),
     sessions: z.record(
       z.string(),
-      z.object({ mode: displayModeSchema, canToggle: z.boolean(), links: z.array(sessionLinkSchema) }),
+      z.object({
+        mode: displayModeSchema,
+        canToggle: z.boolean(),
+        links: z.array(sessionLinkSchema),
+        checklist: z.array(checklistItemSchema),
+      }),
     ),
   }),
 });

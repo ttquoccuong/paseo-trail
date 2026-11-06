@@ -9,7 +9,8 @@ import {
 } from "../server/extract";
 import { findMergeRequestRefs, resolveMergeRequestRefs } from "../server/mr-refs";
 import { globMatches, type LoadedConfig } from "../server/project-config";
-import { findUrls, mainScannedTask, scanTimeline } from "../server/scan";
+import { emptyScan, findUrls, mergeScans, scanTimeline } from "../server/scan";
+import { rankTasks } from "../server/task-evidence";
 import { projectConfigSchema } from "../shared/config";
 
 function rules(focus: object) {
@@ -44,10 +45,10 @@ describe("task docs", () => {
   });
 
   it("makes a doc the main task only on strong evidence", () => {
-    const read = scanTimeline([{ type: "tool_call", detail: { type: "read", filePath: "/p/tasks/a.md" } }], docs);
-    expect(mainScannedTask(read)).toBeUndefined();
-    const edited = scanTimeline([{ type: "tool_call", detail: { type: "edit", filePath: "/p/tasks/a.md" } }], docs);
-    expect(mainScannedTask(edited)).toBe("tasks/a.md");
+    const guess = (filePath: string, type: string) =>
+      rankTasks(mergeScans(emptyScan(), scanTimeline([{ type: "tool_call", detail: { type, filePath } }], docs)).tasks)[0]?.doc;
+    expect(guess("/p/tasks/a.md", "read")).toBeUndefined();
+    expect(guess("/p/tasks/a.md", "edit")).toBe("tasks/a.md");
   });
 });
 

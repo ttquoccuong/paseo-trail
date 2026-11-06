@@ -78,7 +78,24 @@ or as `owner/repo#N` for GitHub. A reference without a URL needs a host and a pr
 - `name !N` resolves only when the project is certain: a project the session already links, a name
   listed once in `projects` or the catalog, or the catalog entry in the group most of the session's
   requests come from.
+- `group/project!N` also finds its host from GitLab pages any session on this machine opened, on a
+  GitLab host you set up (the personal config, a token pasted in Settings, or `GITLAB_HOST`). A
+  project seen on two hosts is left out.
+- `owner/repo#N` is an issue in GitLab. When the repository is a GitLab project (in the catalog or
+  learned as above), the reference opens the GitLab issue from the Other menu instead of becoming a
+  pull request.
 - Ambiguous references and a bare `!N` or `#N` are left out.
+
+If you mostly use GitLab, set `"hashReferences": "gitlab"` in the personal config. An `owner/repo#N`
+whose repository Trail has not placed yet is then read as a GitLab issue on your GitLab host (the
+one listed in the personal config, or the one with a pasted token when none is listed), except for
+repositories this machine has opened on github.com. Trail asks that host once whether the project
+exists (`GET /projects/:path`, with your token; again after a day, or an hour if missing) and goes
+back to GitHub for one that does not. The setting is read from the personal config only.
+
+```json
+{ "hashReferences": "gitlab" }
+```
 
 The bar lists the first 20 MRs the task doc links by URL (references without a URL in the doc are
 not read), every MR or PR pinned, and the five other ones the session mentioned most recently; in
