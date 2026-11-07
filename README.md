@@ -7,7 +7,7 @@ new tab.
 Trail is a [Paseo](https://paseo.sh) plugin that keeps all of it in buttons above the chat box, with
 live status for each request. It works with GitHub and with GitLab, self-hosted included.
 
-![Trail: the task, merge request, file and doc buttons above the chat, each opening a menu](assets/demo.gif)
+![Trail: the task with its checklist, merge request, file and doc buttons above the chat, each opening a menu](assets/demo.gif)
 
 ## Install
 
