@@ -10,11 +10,11 @@ Trail 在聊天输入框上方为 agent 会话正在处理的内容添加按钮�
 
 ## 工作方式
 
-在 agent 运行期间，daemon 每 30 秒（最长三小时）读取一次会话最新的 300 条消息，并记录 agent 读取或编辑过的文件路径，每轮结束时再读取一次。Shell 输出会被忽略。当你提到某个文档或 agent 编辑了它时，该文档就会成为任务。新建的 Claude 和 Codex agent 会获得一个名为 `trail` 的 MCP server，其中包含预先批准的 `pin_link` 工具，以及一条简短说明，要求以 URL 或 `project!N` / `owner/repo#N` 的形式书写 merge request 和 pull request。说明还要求从 fork 会话摘要开始的 agent 自行固定原会话的任务和请求，因为 Trail 无法读取该摘要。这条说明、该工具的描述以及每次调用的结果，都会随对话的其余内容一起发送给 agent 的模型提供商。
+在 agent 运行期间，daemon 每 30 秒（最长三小时）读取一次会话最新的 300 条消息，并记录 agent 读取或编辑过的文件路径，每轮结束时再读取一次。Shell 输出会被忽略。如果 agent 没有固定或命名任务，Trail 会自行推测：你提到的文档权重最高（同一条消息提到多个文档时平分，会话第一条消息加倍），其次是 agent 编辑的文档，agent 只读取或提及的文档权重很低；随着会话转向其他工作，旧的依据会逐渐减弱。当另一个文档的分数接近时，按钮显示 `Task?`，可在菜单中选择正确的任务。新建的 Claude Code agent 会获得一个名为 `trail` 的 MCP server，其中包含预先批准的 `pin_link` 工具，以及一条简短说明，要求以 URL 或 `project!N` / `owner/repo#N` 的形式书写 merge request 和 pull request。说明还要求 agent 在你说出任务时立即固定它，并要求从 fork 会话摘要开始的 agent 自行固定原会话的任务和请求，因为 Trail 无法读取该摘要。这条说明、该工具的描述以及每次调用的结果，都会随对话的其余内容一起发送给 agent 的模型提供商。
 
 ## 设置
 
-Trail 需要 Paseo 0.13 或更高版本，daemon 运行在 macOS 或 Linux 上；未在 Windows 上测试。`glab` 和 `gh` 为可选。
+Trail 需要 Paseo 0.13 或更高版本，daemon 运行在 macOS 或 Linux 上；未在 Windows 上测试。Agent 仅在 Claude Code 上测试。`glab` 和 `gh` 为可选。
 
 链接功能无需设置。要识别任务文档和自托管 GitLab 上的项目，可以在项目中添加 `.paseo/trail/config.json`，或在 `$PASEO_HOME/trail/config.json` 保存一份个人配置。项目配置只能指向项目内部；token 的读取位置、哪些 GitLab 主机可以使用你的 `glab` 登录，以及任务 ID 的匹配规则，都只能写在个人配置中。[配置说明](https://github.com/ttquoccuong/paseo-trail/blob/main/docs/configuration.md) 列出了所有字段。违反这些规则的项目配置会被忽略，原因显示在设置中，并改用个人配置。
 

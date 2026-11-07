@@ -2,6 +2,7 @@ import { mergeRequestStatusSchema, type MergeRequestStatus } from "../shared/lin
 import { errorCode, fetchWithToken, gitLabCredentialId, gitLabHeaders, readBody, readJsonBody, RedirectError, type Credentials } from "./credentials";
 import { parseMergeRequestUrl } from "./extract";
 import { FailureBackoff, HttpError } from "./failures";
+import type { ProjectAnswer } from "./hash-references";
 import { setBounded } from "./files";
 import { requireShownOptions, type MergeOptions } from "./forges";
 // Open MRs change with every push, approval and pipeline; merged or closed ones are settled.
@@ -9,6 +10,9 @@ const OPEN_TTL_MS = 60_000;
 const SETTLED_TTL_MS = 30 * 60_000;
 // Project settings are read again after this long.
 const SETTINGS_TTL_MS = 10 * 60_000;
+// Whether a project exists: a found one is asked again after a day, a missing one after an hour.
+const PROJECT_FOUND_TTL_MS = 24 * 60 * 60_000;
+const PROJECT_MISSING_TTL_MS = 60 * 60_000;
 // After an action GitLab needs a moment (rebase runs async), so re-check sooner than the TTL.
 const AFTER_ACTION_DELAY_MS = 5_000;
 
@@ -63,7 +67,43 @@ export class GitLab {
   // A project's squash rule rarely changes, but does; it is read again after this long.
   private readonly squashOptions = new Map<string, { option: ApiProject["squash_option"]; until: number }>();
 
+  private readonly projects = new Map<string, { answer: "yes" | "no"; until: number }>();
+
   constructor(private readonly credentials: Credentials) {}
+
+  /**
+   * Whether `project` exists on `host`, without waiting: "unknown" until GitLab has answered, and
+   * after any answer other than found or not found. Asked in the background, only with a token.
+   */
+  projectOnHost(host: string, project: string): ProjectAnswer {
+    const key = `${host}/${project}`;
+    const known = this.projects.get(key);
+    if (known && known.until > Date.now()) return known.answer;
+    if (!this.failures.waiting(key)) void this.askProject(host, project, key);
+    return known?.answer ?? "unknown";
+  }
+
+  private async askProject(host: string, project: string, key: string): Promise<void> {
+    if (this.inFlight.has(key)) return;
+    this.inFlight.add(key);
+    try {
+      if ((await this.credentials.value(gitLabCredentialId(host))) === null) return;
+      let answer: "yes" | "no";
+      try {
+        await this.request(host, "GET", `projects/${encodeURIComponent(project)}`);
+        answer = "yes";
+      } catch (error) {
+        if (!(error instanceof HttpError) || error.status !== 404) throw error;
+        answer = "no";
+      }
+      this.failures.clear(key);
+      setBounded(this.projects, key, { answer, until: Date.now() + (answer === "yes" ? PROJECT_FOUND_TTL_MS : PROJECT_MISSING_TTL_MS) });
+    } catch (error) {
+      this.failures.record(key, error);
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
 
   private async request<T>(host: string, method: "GET" | "PUT", path: string): Promise<T> {
     const credential = gitLabCredentialId(host);

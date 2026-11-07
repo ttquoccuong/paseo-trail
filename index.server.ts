@@ -5,7 +5,9 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { Credentials, gitLabCredentialId, normalizeHost } from "./server/credentials";
 import { HostTracker } from "./server/host-tracker";
+import { withPreferredGitLab } from "./server/hash-references";
 import { detectEnvironment, MCP_SCRIPT_NAME } from "./server/environment";
+import { writeMcpLauncher } from "./server/mcp-launcher";
 import { parseMergeRequestUrl, reportedLink, taskDocRules } from "./server/extract";
 import { Forges } from "./server/forges";
 import { GitHub } from "./server/github";
@@ -23,6 +25,7 @@ import {
   preferences,
   setTokenRpc,
   setModeRpc,
+  type ChecklistItem,
   type DisplayMode,
   listLinksRpc,
   mergeMergeRequestRpc,
@@ -32,9 +35,9 @@ import {
 } from "./shared/links";
 
 const MCP_SERVER = "trail";
-const MCP_TOOL = "pin_link";
-// Providers known to accept stdio MCP servers; others would fail agent creation.
-const MCP_PROVIDERS = new Set(["claude", "codex"]);
+const MCP_TOOLS = ["pin_link", "set_main_task", "add_checklist_item", "update_checklist_item"];
+// Trail is tested with Claude Code agents only; agents of other providers are left as they are.
+const MCP_PROVIDERS = new Set(["claude"]);
 const SCAN_WINDOW = 300;
 // The file view shows source and docs, not build output or media.
 const MAX_FILE_BYTES = 512 * 1024;
@@ -59,11 +62,15 @@ const MCP_RUNTIME = existsSync(process.execPath)
 export default function contribute(server: PluginServerContext) {
   const environment = detectEnvironment();
   const mcpScript = environment.pluginDir && join(environment.pluginDir, "bin", MCP_SCRIPT_NAME);
+  // Agents get a launcher whose path survives updates; without one, the script itself.
+  const mcpCommand =
+    mcpScript && existsSync(mcpScript) ? (writeMcpLauncher(environment.homeDir, environment.paseoHome, mcpScript) ?? mcpScript) : null;
   const store = new LinkStore(environment.stateDir);
   const credentials = new Credentials(environment.secretsDir);
   // GitHub needs no configuration, so its token can be set before any PR shows up.
   credentials.requireGitHub();
-  const forges = new Forges(new GitLab(credentials), new GitHub(credentials));
+  const gitlab = new GitLab(credentials);
+  const forges = new Forges(gitlab, new GitHub(credentials));
   const configs = new ProjectConfigs(environment.personalConfig);
   const settings = server.registerSettings(preferences);
   let defaultMode: DisplayMode = "task";
@@ -206,9 +213,59 @@ export default function contribute(server: PluginServerContext) {
     }
   }
 
+  // Agents already asked for their working directory in this daemon run, found or not.
+  const askedAgents = new Set<string>();
+
+  /**
+   * Learns an agent's working directory and title when this daemon run has not seen them yet. A
+   * reload forgets both, and links worked out without the directory miss the project's task docs:
+   * the Task button would vanish or change until the agent's first scan finished.
+   */
+  async function learnAgent(paseo: PluginHandlerContext["paseo"], agentId: string): Promise<void> {
+    if (cwdByAgent.has(agentId) || askedAgents.has(agentId)) return;
+    askedAgents.add(agentId);
+    try {
+      const agent = paseo.agents.ref(agentId);
+      await agent.refresh();
+      if (agent.cwd) cwdByAgent.set(agentId, agent.cwd);
+      const title = (agent.current() as { title?: string | null } | null)?.title;
+      if (title) titleByAgent.set(agentId, title);
+    } catch (error) {
+      // The first scan of the agent learns the directory too; until then links go without it.
+      console.error(`trail: could not read agent ${agentId}`, error);
+    }
+  }
+
+  // GitLab hosts the user set up: the personal config's, those with a pasted token and GITLAB_HOST.
+  // Only these teach Trail which projects live on GitLab; a host seen only in a conversation does not.
+  function trustedGitLabHosts(): Set<string> {
+    const personal = configs.personal()?.config.gitlab.map((entry) => entry.host) ?? [];
+    const environmentHost = normalizeHost(process.env.GITLAB_HOST);
+    return new Set([...personal, ...storedHosts, ...(environmentHost ? [environmentHost] : [])]);
+  }
+
+  // `#N` of a GitLab project is an issue. Learned projects come first; with `hashReferences: "gitlab"`
+  // in the personal config, a repository not placed yet is read as GitLab's on the one GitLab host
+  // the user set up, until GitLab says no such project exists there.
+  async function gitlabProjectsFor(agentId: string): Promise<ReadonlyMap<string, string>> {
+    const trusted = trustedGitLabHosts();
+    const learned = await store.gitlabProjects(trusted);
+    const personal = configs.personal()?.config;
+    if (personal?.hashReferences !== "gitlab") return learned;
+    const configured = personal.gitlab.map((entry) => entry.host);
+    const host = configured.length === 1 ? configured[0] : configured.length === 0 && trusted.size === 1 ? [...trusted][0] : null;
+    return withPreferredGitLab({
+      learned,
+      githubRepos: await store.githubRepos(),
+      mentioned: await store.hashReferenceRepos(agentId),
+      host,
+      onGitLab: (gitlabHost, project) => gitlab.projectOnHost(gitlabHost, project),
+    });
+  }
+
   async function linksFor(agentId: string): Promise<SessionLink[]> {
     const taskIdSources = [await branchOf(cwdByAgent.get(agentId)), titleByAgent.get(agentId)];
-    const links = await store.links(agentId, { ...contextFor(agentId), taskIdSources });
+    const links = await store.links(agentId, { ...contextFor(agentId), taskIdSources, gitlabProjects: await gitlabProjectsFor(agentId) });
     requireHosts(agentId, links);
     return links;
   }
@@ -261,8 +318,13 @@ export default function contribute(server: PluginServerContext) {
           if (agent.cwd) cwdByAgent.set(agentId, agent.cwd);
           const title = (agent.current() as { title?: string | null } | null)?.title;
           if (title) titleByAgent.set(agentId, title);
-          const items = page.entries.map((entry: { item: TimelineItemLike }) => entry.item);
-          await store.saveScan(agentId, scanTimeline(items, contextFor(agentId).rules));
+          const items = page.entries.map((entry: { item: TimelineItemLike; timestamp?: string }) => ({
+            ...entry.item,
+            timestamp: entry.timestamp,
+          }));
+          // Without older entries the window starts at the session's first message.
+          const fromStart = page.hasOlder === false;
+          await store.saveScan(agentId, scanTimeline(items, contextFor(agentId).rules, { fromStart }));
         } catch (error) {
           console.error(`trail: scan failed for ${agentId}`, error);
         } finally {
@@ -274,7 +336,8 @@ export default function contribute(server: PluginServerContext) {
   }
 
   server.handle(listLinksRpc, async ({ agentIds }, { paseo }) => {
-    const sessions: Record<string, { mode: DisplayMode; canToggle: boolean; links: SessionLink[] }> = {};
+    const sessions: Record<string, { mode: DisplayMode; canToggle: boolean; links: SessionLink[]; checklist: ChecklistItem[] }> = {};
+    await Promise.all(agentIds.map((agentId) => learnAgent(paseo, agentId)));
     for (const agentId of agentIds) {
       // One session's broken state must not empty the bar of every other session.
       try {
@@ -287,18 +350,28 @@ export default function contribute(server: PluginServerContext) {
         // Without a task there is nothing to narrow to, so the session shows everything.
         const canToggle = taskLinks.some((link) => link.kind === "task");
         const mode = canToggle ? ((await store.mode(agentId)) ?? defaultMode) : "all";
-        const links = mode === "all" ? [...taskLinks, ...(await store.otherLinks(agentId, taskLinks))] : taskLinks;
-        sessions[agentId] = { mode, canToggle, links };
+        const links =
+          mode === "all"
+            ? [
+                ...taskLinks,
+                ...(await store.otherLinks(agentId, taskLinks, cwdByAgent.get(agentId), {
+                  catalog: contextFor(agentId).catalog,
+                  gitlabProjects: await gitlabProjectsFor(agentId),
+                })),
+              ]
+            : taskLinks;
+        sessions[agentId] = { mode, canToggle, links, checklist: (await store.task(agentId)).items };
       } catch (error) {
         console.error(`trail: links failed for ${agentId}`, error);
-        sessions[agentId] = { mode: "all", canToggle: false, links: [] };
+        sessions[agentId] = { mode: "all", canToggle: false, links: [], checklist: [] };
       }
     }
     return { language, sessions };
   });
 
-  server.handle(pinLinkRpc, async ({ agentId, target, label, unpin }) => {
+  server.handle(pinLinkRpc, async ({ agentId, target, label, unpin }, { paseo }) => {
     if (unpin) return { removed: await store.unpin(agentId, target) };
+    await learnAgent(paseo, agentId);
     // The same recognition as the pin_link tool: task doc path or ID, MR/PR, or any http(s) URL.
     const link = reportedLink(target, undefined, label, contextFor(agentId).rules);
     if (!link) throw new Error(`Not a link Trail can pin: ${target}`);
@@ -324,25 +397,27 @@ export default function contribute(server: PluginServerContext) {
     return {};
   });
 
-  async function requireAgentMergeRequest(agentId: string, url: string): Promise<void> {
+  async function requireAgentMergeRequest(paseo: PluginHandlerContext["paseo"], agentId: string, url: string): Promise<void> {
+    await learnAgent(paseo, agentId);
     const links = await linksFor(agentId);
     if (!links.some((link) => link.kind === "mr" && link.url === url)) {
       throw new Error(`Not one of this session's merge requests: ${url}`);
     }
   }
 
-  server.handle(rebaseMergeRequestRpc, async ({ agentId, url }) => {
-    await requireAgentMergeRequest(agentId, url);
+  server.handle(rebaseMergeRequestRpc, async ({ agentId, url }, { paseo }) => {
+    await requireAgentMergeRequest(paseo, agentId, url);
     await forges.rebase(url);
     return {};
   });
 
-  server.handle(mergeMergeRequestRpc, async ({ agentId, url, sha, squash, removeSourceBranch }) => {
-    await requireAgentMergeRequest(agentId, url);
+  server.handle(mergeMergeRequestRpc, async ({ agentId, url, sha, squash, removeSourceBranch }, { paseo }) => {
+    await requireAgentMergeRequest(paseo, agentId, url);
     return { state: await forges.merge(url, sha, { squash, removeSourceBranch }) };
   });
 
-  server.handle(readTaskDocRpc, async ({ agentId, file, path: requested }) => {
+  server.handle(readTaskDocRpc, async ({ agentId, file, path: requested }, { paseo }) => {
+    await learnAgent(paseo, agentId);
     const task = await store.mainTask(agentId, contextFor(agentId));
     const bundle = task?.bundle ?? [];
     // Only paths the daemon listed itself are readable, so the client cannot name arbitrary files.
@@ -422,6 +497,7 @@ export default function contribute(server: PluginServerContext) {
     stopMidTurnScan(agentId);
     cwdByAgent.delete(agentId);
     titleByAgent.delete(agentId);
+    askedAgents.delete(agentId);
     scannedThisRun.delete(agentId);
     store.forget(agentId);
   }
@@ -431,7 +507,9 @@ export default function contribute(server: PluginServerContext) {
 
   server.before("agent.create", ({ request }) => {
     const provider = request.config.provider.split("/")[0];
-    if (!MCP_PROVIDERS.has(provider) || !mcpScript || !existsSync(mcpScript)) return request;
+    // Not the install folder this load found: after an update it may already be deleted, while the
+    // launcher finds the current one when the agent starts it.
+    if (!MCP_PROVIDERS.has(provider) || !mcpCommand || !existsSync(mcpCommand)) return request;
     return {
       ...request,
       config: {
@@ -441,7 +519,7 @@ export default function contribute(server: PluginServerContext) {
           [MCP_SERVER]: {
             type: "stdio",
             ...MCP_RUNTIME,
-            args: [mcpScript],
+            args: [mcpCommand],
             env: { ...MCP_RUNTIME.env, TRAIL_STATE_DIR: environment.stateDir },
           },
         },
@@ -449,7 +527,7 @@ export default function contribute(server: PluginServerContext) {
           ...request.config.toolPolicy,
           preapproved: [
             ...(request.config.toolPolicy?.preapproved ?? []),
-            { kind: "mcp", server: MCP_SERVER, tool: MCP_TOOL },
+            ...MCP_TOOLS.map((tool) => ({ kind: "mcp" as const, server: MCP_SERVER, tool })),
           ],
         },
       },

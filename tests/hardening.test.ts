@@ -246,7 +246,7 @@ describe("state that was cut short or edited by hand", () => {
     expect((await store.links("agent-a", context)).map((link) => link.url)).toEqual(["https://example.test/page"]);
 
     writeFileSync(join(state, "agent-b.scanned.json"), "{}");
-    await store.saveScan("agent-b", { tasks: {}, mergeRequests: ["https://gitlab.example.test/a/b/-/merge_requests/1"] });
+    await store.saveScan("agent-b", { sightings: [], fromStart: false, mergeRequests: ["https://gitlab.example.test/a/b/-/merge_requests/1"] });
     expect((await store.links("agent-b", context)).map((link) => link.kind)).toEqual(["mr"]);
   });
 

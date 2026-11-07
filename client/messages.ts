@@ -12,12 +12,22 @@ type Keys<T> = {
 const en = {
   task: {
     label: "Task · {{name}}",
+    labelProgress: "Task {{done}}/{{total}} · {{name}}",
+    labelGuess: "Task? · {{name}}",
+    guessed: "Guessed from the conversation; pick the right task:",
+    setMain: "Set as main task: {{name}}",
     panelTitle: "Task doc",
     viewLocal: "View local copy",
     openRemote: "Open on {{forge}}",
     openPage: "Open page",
     showAll: "Show all links",
     showTask: "Only this task's links",
+  },
+  checklist: {
+    progress: "Checklist · {{done}}/{{total}} done",
+    why: "Why: {{text}}",
+    note: "Note: {{text}}",
+    updated: "Updated {{age}} ago",
   },
   groups: {
     file: "Files ({{count}})",
@@ -26,7 +36,6 @@ const en = {
     fileTitle: "Files this session touched",
     docTitle: "Documents this session opened",
     linkTitle: "Other links in this session",
-    edited: "{{path}} (edited)",
   },
   mr: {
     buttonGitLab: "GitLab MR",
@@ -195,12 +204,21 @@ const en = {
 const vi = {
   task: {
     label: "Task · {{name}}",
+    labelGuess: "Task? · {{name}}",
+    guessed: "Đoán từ hội thoại; chọn đúng task:",
+    setMain: "Đặt làm task chính: {{name}}",
     panelTitle: "Task doc",
     viewLocal: "Xem bản local",
     openRemote: "Mở trên {{forge}}",
     openPage: "Mở trang",
     showAll: "Hiện tất cả link",
     showTask: "Chỉ link của task",
+  },
+  checklist: {
+    progress: "Checklist · xong {{done}}/{{total}}",
+    why: "Vì sao: {{text}}",
+    note: "Ghi chú: {{text}}",
+    updated: "Cập nhật {{age}} trước",
   },
   groups: {
     file: "Files ({{count}})",
@@ -209,7 +227,6 @@ const vi = {
     fileTitle: "File phiên này đã đụng",
     docTitle: "Tài liệu phiên này đã mở",
     linkTitle: "Link khác trong phiên",
-    edited: "{{path}} (đã sửa)",
   },
   mr: {
     title: "Merge request và pull request",

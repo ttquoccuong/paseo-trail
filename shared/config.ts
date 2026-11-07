@@ -126,6 +126,11 @@ export const projectConfigSchema = z.object({
       bundle: z.enum(["siblings", "none"]).default("none"),
     })
     .optional(),
+  /**
+   * What `group/project#N` means when Trail has not seen the project anywhere yet: a GitHub pull
+   * request (default) or an issue on your GitLab. Personal config only.
+   */
+  hashReferences: z.enum(["github", "gitlab"]).optional(),
   /** Self-hosted GitLab instances and where their tokens live. gitlab.com needs no entry. */
   gitlab: z
     .array(

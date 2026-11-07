@@ -190,6 +190,7 @@ export function resolveMentions(
   knownUrls: string[],
   catalog: Array<ProjectCandidate & { name: string }>,
   defaultHost: string | undefined,
+  gitlabProjects: ReadonlyMap<string, string> = NO_PROJECTS,
 ): string[] {
   // Every session is polled every few seconds with mostly the same mentions; the answer only
   // changes with them, the known URLs, the default host or the catalog (a new array when it changes).
@@ -198,21 +199,69 @@ export function resolveMentions(
     results = new Map();
     resolvedByCatalog.set(catalog, results);
   }
-  const key = JSON.stringify([mentions, knownUrls, defaultHost ?? null]);
+  const key = JSON.stringify([mentions, knownUrls, defaultHost ?? null, projectsVersion(gitlabProjects)]);
   const cached = results.get(key);
   if (cached) return cached;
-  const resolved = resolveMentionsNow(mentions, knownUrls, catalog, defaultHost);
+  const resolved = resolveMentionsNow(mentions, knownUrls, catalog, defaultHost, gitlabProjects);
   setBounded(results, key, resolved);
   return resolved;
 }
 
 const resolvedByCatalog = new WeakMap<object, Map<string, string[]>>();
 
+const NO_PROJECTS: ReadonlyMap<string, string> = new Map();
+// The project map is rebuilt as a new object when it changes; each gets a number for the cache key.
+const projectVersions = new WeakMap<object, number>();
+let nextProjectVersion = 0;
+function projectsVersion(projects: ReadonlyMap<string, string>): number {
+  let version = projectVersions.get(projects);
+  if (version === undefined) {
+    version = nextProjectVersion++;
+    projectVersions.set(projects, version);
+  }
+  return version;
+}
+
+/**
+ * Where `repository` lives when it is a GitLab project: a host from the config's catalog, or from
+ * GitLab pages this machine's sessions opened. In GitLab `group/project#N` is an issue, so such a
+ * reference is never a GitHub pull request.
+ */
+export function gitlabHostOf(
+  repository: string,
+  catalog: Array<ProjectCandidate & { name: string }>,
+  gitlabProjects: ReadonlyMap<string, string>,
+): string | null {
+  const hosts = new Set(catalog.filter((entry) => entry.project === repository).map((entry) => entry.host));
+  if (hosts.size === 1) return [...hosts][0];
+  if (hosts.size > 1) return null;
+  return gitlabProjects.get(repository) ?? null;
+}
+
+/** The repository of an `owner/repo#N` mention, or null for anything else. */
+export function hashReferenceRepository(mention: string): string | null {
+  return GITHUB_MENTION.exec(mention)?.[1] ?? null;
+}
+
+/** `group/project#N` references to GitLab projects, as issue URLs, in the order they were made. */
+export function gitlabIssueUrls(
+  mentions: string[],
+  catalog: Array<ProjectCandidate & { name: string }>,
+  gitlabProjects: ReadonlyMap<string, string>,
+): string[] {
+  return mentions.flatMap((mention) => {
+    const reference = GITHUB_MENTION.exec(mention);
+    const host = reference ? gitlabHostOf(reference[1], catalog, gitlabProjects) : null;
+    return reference && host ? [`https://${host}/${reference[1]}/-/issues/${reference[2]}`] : [];
+  });
+}
+
 function resolveMentionsNow(
   mentions: string[],
   knownUrls: string[],
   catalog: Array<ProjectCandidate & { name: string }>,
   defaultHost: string | undefined,
+  gitlabProjects: ReadonlyMap<string, string>,
 ): string[] {
   const isUrl = (mention: string) => /^https?:\/\//.test(mention);
   const seen = [...knownUrls, ...mentions.filter(isUrl)].flatMap((url) => {
@@ -262,6 +311,9 @@ function resolveMentionsNow(
     // the same name under another path: then the reference is a mistyped path, not a new project.
     const knownElsewhere = projectsWithSegment(lastSegment(name)).some((project) => project !== name);
     if (name.includes("/") && defaultHost && !knownElsewhere) return { host: defaultHost, project: name };
+    // A full path this machine has seen on exactly one GitLab host.
+    const learned = gitlabProjects.get(name);
+    if (learned) return { host: learned, project: name };
     return null;
   };
 
@@ -272,9 +324,12 @@ function resolveMentionsNow(
   return mentions.flatMap((mention) => {
     // Kept in canonical form; a stored URL the current parser rejects is dropped.
     if (isUrl(mention)) return findChangeRequests(mention).slice(0, 1);
-    // A GitHub reference already names its repository; github.com is the only host it can mean.
     const github = GITHUB_MENTION.exec(mention);
-    if (github) return checked(`https://github.com/${github[1]}/pull/${github[2]}`);
+    if (github) {
+      // The same notation is an issue in GitLab; a project known there is not on github.com.
+      if (gitlabHostOf(github[1], catalog, gitlabProjects)) return [];
+      return checked(`https://github.com/${github[1]}/pull/${github[2]}`);
+    }
     const at = mention.lastIndexOf("!");
     if (at <= 0) return [];
     const target = resolveProject(mention.slice(0, at));

@@ -8,6 +8,7 @@ import { Credentials, fetchWithToken, gitLabCredentialId, readBody } from "../se
 import { findChangeRequests, taskDocRules } from "../server/extract";
 import { findGlobPaths, splitGlob } from "../server/project-config";
 import { findUrls, mergeScans, SCAN_LIMITS, scanTimeline, type TimelineItemLike } from "../server/scan";
+import { emptyLedger } from "../server/task-evidence";
 import { LinkStore } from "../server/store";
 import { projectConfigSchema } from "../shared/config";
 
@@ -77,12 +78,12 @@ describe("scan state stays small and fast", () => {
 
   it("merges large states in bounded time and size", () => {
     const big = {
-      tasks: {},
+      tasks: emptyLedger(),
       mergeRequests: Array.from({ length: 8000 }, (_, i) => (i % 2 ? `grp/p${i}!${i}` : `https://gitlab.example.test/g/p${i}/-/merge_requests/${i}`)),
       urls: Array.from({ length: 60_000 }, (_, i) => `https://u${i}.example`),
       files: {},
     };
-    const { value, ms } = timed(() => mergeScans(big, big));
+    const { value, ms } = timed(() => mergeScans(big, { ...big, sightings: [], fromStart: false }));
     expect(ms).toBeLessThan(500);
     expect(value.mergeRequests).toHaveLength(SCAN_LIMITS.mergeRequests);
     expect(value.urls).toHaveLength(SCAN_LIMITS.urls);
