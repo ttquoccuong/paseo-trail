@@ -1,7 +1,7 @@
 {
   "name": "paseo-trail",
-  "version": "0.2.0",
-  "description": "Buttons above the chat for a session's task, merge and pull requests with live status, and touched files",
+  "version": "0.2.1",
+  "description": "Buttons above the chat for a session's task and its checklist, merge and pull requests with live status, and touched files",
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -383,7 +383,7 @@ function handle(message) {
       return reply(id, {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "trail", version: "0.2.0" },
+        serverInfo: { name: "trail", version: "0.2.1" },
         instructions: INSTRUCTIONS,
       });
     case "ping":
