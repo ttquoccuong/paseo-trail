@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-11-09
+
+- **Plugin page describes 0.2.0.** `OVERVIEW.md` and its Vietnamese and Simplified Chinese
+  translations now cover the checklist, the four MCP tools, the launcher agents start them through,
+  the optional reminder hook and the limits after an update. The manifest description names the
+  checklist, and the plugin's images show it. No code changes.
+
 ## 0.2.0 — 2026-11-06
 
 **Upgrade notes.** If you installed Trail from Git or the registry, sessions created on 0.1.0 still
